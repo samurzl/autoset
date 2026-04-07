@@ -335,6 +335,7 @@ Example with a Gemma 4 multimodal model:
 python anime_clip_caption.py \
   --input-dir data/clips_subset/train \
   --model-repo google/gemma-4-E4B-it \
+  --cache-dir /runpod-volume/hf-cache \
   --device cuda
 ```
 
@@ -342,6 +343,7 @@ python anime_clip_caption.py \
 python anime_clip_caption.py \
   --input-dir data/clips_subset/val \
   --model-repo google/gemma-4-E4B-it \
+  --cache-dir /runpod-volume/hf-cache \
   --device cuda
 ```
 
@@ -357,6 +359,7 @@ python3 anime_clip_caption.py \
 What it does:
 
 - Loads the chosen Hugging Face multimodal model.
+- If `--cache-dir` is set, stores downloaded Hugging Face model files there so they can persist across pod restarts when backed by network storage.
 - Samples video frames from each clip.
 - Uses `tags.jsonl` in the same directory as helper hints when present.
 - Includes audio only when the model supports audio and the clip has an audio track.

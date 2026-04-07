@@ -21,6 +21,12 @@ try:
     import torchcodec  # noqa: F401
 except ModuleNotFoundError:
     torchcodec = None
+    TORCHCODEC_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    torchcodec = None
+    TORCHCODEC_IMPORT_ERROR = exc
+else:
+    TORCHCODEC_IMPORT_ERROR = None
 
 try:
     from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -104,6 +110,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"JSONL manifest path. Defaults to <input-dir>/{DEFAULT_OUTPUT_FILENAME}.",
     )
     parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help=(
+            "Optional Hugging Face cache directory for model downloads. "
+            "Use this to store model files on persistent storage."
+        ),
+    )
+    parser.add_argument(
         "--tags-file",
         type=Path,
         help=(
@@ -147,6 +161,9 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
     if args.output_file.exists() and args.output_file.is_dir():
         parser.error("--output-file must be a file path")
+
+    if args.cache_dir is not None and args.cache_dir.exists() and not args.cache_dir.is_dir():
+        parser.error("--cache-dir must be a directory path")
 
     tags_file = getattr(args, "tags_file", None)
     if tags_file is None:
@@ -269,10 +286,18 @@ def require_runtime(device: str) -> None:
             "Missing required system tool: ffprobe. Install FFmpeg so ffprobe is available on PATH."
         )
     if torch is None or AutoProcessor is None or AutoModelForMultimodalLM is None or torchcodec is None:
-        raise SystemExit(
+        message = (
             "Missing dependencies for captioning. Install them with: "
             "python -m pip install -r requirements.txt"
         )
+        if TORCHCODEC_IMPORT_ERROR is not None:
+            message += (
+                " TorchCodec is installed but failed to load. This usually means your "
+                "torch and torchcodec versions do not match, FFmpeg is incomplete, or "
+                "CUDA runtime libraries such as libnvrtc are missing. "
+                f"Original error: {type(TORCHCODEC_IMPORT_ERROR).__name__}: {TORCHCODEC_IMPORT_ERROR}"
+            )
+        raise SystemExit(message)
     if device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA device requested but torch.cuda.is_available() is false.")
 
@@ -357,13 +382,19 @@ def model_supports_audio(model: Any) -> bool:
     return any(str(value).lower() == "audio" for value in values)
 
 
-def load_captioning_components(model_repo: str, device: str, dtype_name: str) -> tuple[Any, Any, bool]:
+def load_captioning_components(
+    model_repo: str,
+    device: str,
+    dtype_name: str,
+    cache_dir: Path | None = None,
+) -> tuple[Any, Any, bool]:
     assert AutoProcessor is not None
     assert AutoModelForMultimodalLM is not None
-    processor = AutoProcessor.from_pretrained(model_repo)
+    processor = AutoProcessor.from_pretrained(model_repo, cache_dir=cache_dir)
     model = AutoModelForMultimodalLM.from_pretrained(
         model_repo,
         torch_dtype=resolve_torch_dtype(dtype_name),
+        cache_dir=cache_dir,
     )
     if hasattr(model, "to"):
         model = model.to(device)
@@ -654,11 +685,16 @@ def run(args: argparse.Namespace) -> int:
         print(f"No supported videos found in {args.input_dir}", file=sys.stderr)
         return 1
 
+    cache_dir = getattr(args, "cache_dir", None)
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     require_runtime(args.device)
     processor, model, audio_supported = load_captioning_components(
         model_repo=args.model_repo,
         device=args.device,
         dtype_name=args.dtype,
+        cache_dir=cache_dir,
     )
     tags_file = getattr(args, "tags_file", None)
     if tags_file is None:

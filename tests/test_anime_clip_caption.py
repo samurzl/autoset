@@ -87,6 +87,27 @@ class AnimeClipCaptionHelperTests(unittest.TestCase):
 
             self.assertEqual(args.tags_file, tags_file)
 
+    def test_validate_args_rejects_cache_dir_file(self) -> None:
+        parser = anime_clip_caption.build_parser()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache_file = root / "cache-file"
+            cache_file.write_text("x", encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                args = parser.parse_args(
+                    [
+                        "--input-dir",
+                        temp_dir,
+                        "--model-repo",
+                        "google/gemma-4-E4B-it",
+                        "--cache-dir",
+                        str(cache_file),
+                    ]
+                )
+                anime_clip_caption.validate_args(parser, args)
+
     def test_require_runtime_reports_missing_cuda(self) -> None:
         fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
 
@@ -101,6 +122,22 @@ class AnimeClipCaptionHelperTests(unittest.TestCase):
                 anime_clip_caption.require_runtime("cuda")
 
         self.assertIn("torch.cuda.is_available", str(context.exception))
+
+    def test_require_runtime_surfaces_torchcodec_import_error(self) -> None:
+        with patch.object(anime_clip_caption, "torch", object()), patch.object(
+            anime_clip_caption, "AutoProcessor", object()
+        ), patch.object(anime_clip_caption, "AutoModelForMultimodalLM", object()), patch.object(
+            anime_clip_caption, "torchcodec", None
+        ), patch.object(
+            anime_clip_caption, "TORCHCODEC_IMPORT_ERROR", RuntimeError("libnvrtc.so.13 missing")
+        ), patch(
+            "anime_clip_caption.shutil.which", return_value="/usr/bin/ffprobe"
+        ):
+            with self.assertRaises(SystemExit) as context:
+                anime_clip_caption.require_runtime("cpu")
+
+        self.assertIn("TorchCodec is installed but failed to load", str(context.exception))
+        self.assertIn("libnvrtc.so.13 missing", str(context.exception))
 
     def test_probe_video_parses_duration_and_audio_presence(self) -> None:
         payload = {
@@ -271,18 +308,31 @@ Traffic hums while a distant voice calls out.
         fake_model = FakeModel(config=SimpleNamespace(audio_config=object()))
         fake_processor = object()
         fake_torch = SimpleNamespace(float16="float16", bfloat16="bfloat16", float32="float32")
+        seen_processor_calls: list[tuple[str, Path | None]] = []
+        seen_model_calls: list[tuple[str, object, Path | None]] = []
 
         with patch.object(anime_clip_caption, "torch", fake_torch), patch.object(
-            anime_clip_caption, "AutoProcessor", SimpleNamespace(from_pretrained=lambda repo: fake_processor)
+            anime_clip_caption,
+            "AutoProcessor",
+            SimpleNamespace(
+                from_pretrained=lambda repo, cache_dir=None: seen_processor_calls.append((repo, cache_dir))
+                or fake_processor
+            ),
         ), patch.object(
             anime_clip_caption,
             "AutoModelForMultimodalLM",
-            SimpleNamespace(from_pretrained=lambda repo, torch_dtype: fake_model),
+            SimpleNamespace(
+                from_pretrained=lambda repo, torch_dtype, cache_dir=None: seen_model_calls.append(
+                    (repo, torch_dtype, cache_dir)
+                )
+                or fake_model
+            ),
         ):
             processor, model, supports_audio = anime_clip_caption.load_captioning_components(
                 model_repo="google/gemma-4-E4B-it",
                 device="cuda",
                 dtype_name="float16",
+                cache_dir=Path("/tmp/hf-cache"),
             )
 
         self.assertIs(processor, fake_processor)
@@ -290,6 +340,11 @@ Traffic hums while a distant voice calls out.
         self.assertTrue(model.was_eval)
         self.assertEqual(model.device, "cuda")
         self.assertTrue(supports_audio)
+        self.assertEqual(seen_processor_calls, [("google/gemma-4-E4B-it", Path("/tmp/hf-cache"))])
+        self.assertEqual(
+            seen_model_calls,
+            [("google/gemma-4-E4B-it", "float16", Path("/tmp/hf-cache"))],
+        )
 
 
 class AnimeClipCaptionProcessTests(unittest.TestCase):
@@ -493,6 +548,39 @@ class AnimeClipCaptionRunTests(unittest.TestCase):
                 return_value=make_record(clip, "captioned"),
             ):
                 exit_code = anime_clip_caption.run(args)
+
+        self.assertEqual(exit_code, 0)
+
+    def test_run_creates_cache_dir_and_passes_it_to_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            clip = root / "a.mp4"
+            clip.write_bytes(b"a")
+            cache_dir = root / "persistent-cache"
+            args = argparse.Namespace(
+                input_dir=root,
+                model_repo="google/gemma-4-E4B-it",
+                output_file=root / "captions.jsonl",
+                tags_file=None,
+                device="cpu",
+                dtype="auto",
+                num_frames=12,
+                max_new_tokens=768,
+                cache_dir=cache_dir,
+            )
+            seen_cache_dirs: list[Path | None] = []
+
+            with patch("anime_clip_caption.require_runtime"), patch(
+                "anime_clip_caption.load_captioning_components",
+                side_effect=lambda **kwargs: seen_cache_dirs.append(kwargs.get("cache_dir")) or (object(), object(), True),
+            ), patch(
+                "anime_clip_caption.process_video",
+                return_value=make_record(clip, "captioned"),
+            ):
+                exit_code = anime_clip_caption.run(args)
+
+            self.assertTrue(cache_dir.is_dir())
+            self.assertEqual(seen_cache_dirs, [cache_dir])
 
         self.assertEqual(exit_code, 0)
 
