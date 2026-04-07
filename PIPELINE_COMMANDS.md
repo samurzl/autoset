@@ -183,7 +183,9 @@ Options for `anime_clip_caption.py`:
 - `--tags-file TAGS_FILE`: Optional JSONL tag manifest used as helper hints. Default: `<input-dir>/tags.jsonl` if that file exists.
 - `--device {cuda,cpu}`: Device used for inference. Default: `cuda`.
 - `--dtype {auto,float16,bfloat16,float32}`: Model dtype hint. Default: `auto`.
-- `--num-frames NUM_FRAMES`: Number of sampled frames per clip. Default: `12`. Must be a positive integer.
+- `--num-frames NUM_FRAMES`: Minimum number of sampled frames per clip when ratio-based sampling would select fewer or metadata is unavailable. Default: `12`. Must be a positive integer.
+- `--frame-sample-ratio FRAME_SAMPLE_RATIO`: Target fraction of source frames to sample when metadata is available. Default: `0.5`.
+- `--sample-all-frames`: Load every frame from each clip instead of sampling.
 - `--max-new-tokens MAX_NEW_TOKENS`: Maximum number of generated tokens per clip. Default: `768`. Must be a positive integer.
 
 ## 8. Export LTX-ready manifests

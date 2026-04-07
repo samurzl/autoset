@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
 DEFAULT_DEVICE = "cuda"
 DEFAULT_DTYPE = "auto"
 DEFAULT_NUM_FRAMES = 12
+DEFAULT_FRAME_SAMPLE_RATIO = 0.5
 DEFAULT_MAX_NEW_TOKENS = 768
 DEFAULT_OUTPUT_FILENAME = "captions.jsonl"
 DEFAULT_TAGS_FILENAME = "tags.jsonl"
@@ -70,6 +72,15 @@ WHITESPACE_PATTERN = re.compile(r"\s+")
 class VideoMetadata:
     duration: float
     has_audio_track: bool
+    fps: float | None = None
+    total_frames: int | None = None
+
+
+@dataclass(frozen=True)
+class FrameSamplingPlan:
+    do_sample_frames: bool
+    num_frames: int | None = None
+    fps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def positive_ratio(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0 or parsed > 1:
+        raise argparse.ArgumentTypeError("value must be greater than 0 and at most 1")
     return parsed
 
 
@@ -141,7 +159,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--num-frames",
         type=positive_int,
         default=DEFAULT_NUM_FRAMES,
-        help=f"Number of sampled frames per clip. Defaults to {DEFAULT_NUM_FRAMES}.",
+        help=(
+            "Minimum number of sampled frames per clip when ratio-based sampling would select fewer "
+            f"or metadata is unavailable. Defaults to {DEFAULT_NUM_FRAMES}."
+        ),
+    )
+    parser.add_argument(
+        "--frame-sample-ratio",
+        type=positive_ratio,
+        default=DEFAULT_FRAME_SAMPLE_RATIO,
+        help=(
+            "Target fraction of source frames to sample when video frame metadata is available. "
+            f"Defaults to {DEFAULT_FRAME_SAMPLE_RATIO}."
+        ),
+    )
+    parser.add_argument(
+        "--sample-all-frames",
+        action="store_true",
+        help="Load every frame from each clip instead of sampling.",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -310,6 +345,36 @@ def safe_float(value: Any) -> float | None:
     return parsed if parsed >= 0 else None
 
 
+def safe_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def safe_fraction_float(value: Any) -> float | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text or text == "0/0":
+        return None
+
+    if "/" not in text:
+        parsed = safe_float(text)
+        return parsed if parsed is not None and parsed > 0 else None
+
+    numerator_text, denominator_text = text.split("/", 1)
+    numerator = safe_float(numerator_text)
+    denominator = safe_float(denominator_text)
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+
+    parsed = numerator / denominator
+    return parsed if parsed > 0 else None
+
+
 def probe_video(video_path: Path) -> VideoMetadata:
     command = [
         "ffprobe",
@@ -335,7 +400,20 @@ def probe_video(video_path: Path) -> VideoMetadata:
         raise ValueError(f"Could not determine duration for {video_path}")
 
     has_audio_track = any(stream.get("codec_type") == "audio" for stream in streams)
-    return VideoMetadata(duration=duration, has_audio_track=has_audio_track)
+    fps = safe_fraction_float(video_stream.get("avg_frame_rate"))
+    if fps is None:
+        fps = safe_fraction_float(video_stream.get("r_frame_rate"))
+
+    total_frames = safe_int(video_stream.get("nb_frames"))
+    if total_frames is None and fps is not None:
+        total_frames = max(1, int(round(duration * fps)))
+
+    return VideoMetadata(
+        duration=duration,
+        has_audio_track=has_audio_track,
+        fps=fps,
+        total_frames=total_frames,
+    )
 
 
 def resolve_torch_dtype(dtype_name: str) -> Any:
@@ -413,15 +491,50 @@ def determine_audio_plan(metadata: VideoMetadata, audio_supported: bool) -> tupl
     return True, None
 
 
+def choose_frame_sampling_plan(
+    metadata: VideoMetadata,
+    min_frames: int,
+    frame_sample_ratio: float,
+    sample_all_frames: bool,
+) -> FrameSamplingPlan:
+    if sample_all_frames:
+        return FrameSamplingPlan(do_sample_frames=False)
+
+    if metadata.total_frames is not None and metadata.total_frames > 0:
+        target_frames = max(min_frames, math.ceil(metadata.total_frames * frame_sample_ratio))
+        return FrameSamplingPlan(
+            do_sample_frames=True,
+            num_frames=min(target_frames, metadata.total_frames),
+        )
+
+    if metadata.fps is not None and metadata.fps > 0:
+        return FrameSamplingPlan(
+            do_sample_frames=True,
+            fps=metadata.fps * frame_sample_ratio,
+        )
+
+    return FrameSamplingPlan(do_sample_frames=True, num_frames=min_frames)
+
+
 def build_prompt(include_audio: bool, tag_hints: TagHints | None = None) -> str:
     lines = [
         "Caption this single short video clip.",
-        "Write exactly one plain paragraph of continuous text.",
+        "Write exactly one plain paragraph of continuous text in strict chronological order from the first moment of the clip to the last.",
         (
             "Do not use labels like SCENE_OVERVIEW, VISUAL_DETAILS, DIALOGUE, OTHER_SOUNDS, "
             "VISUAL, or AUDIO."
         ),
         "Do not add any prefatory text, bullet points, markdown fences, or extra formatting.",
+        (
+            "Be exhaustive and concrete. Include every clearly observable action, reveal, entrance, exit, "
+            "impact, object interaction, body movement, camera movement, framing change, lighting change, "
+            "and relevant background detail that appears in the clip."
+        ),
+        (
+            "Only describe what is directly visible or audible. Do not infer names, identities, relationships, "
+            "intentions, emotions, causes, or off-screen events unless the clip clearly shows or states them."
+        ),
+        "If a detail is ambiguous or not clearly present, leave it out instead of guessing.",
     ]
 
     if tag_hints is not None and (tag_hints.general_tags or tag_hints.character_tags):
@@ -441,9 +554,10 @@ def build_prompt(include_audio: bool, tag_hints: TagHints | None = None) -> str:
         [
             "",
             (
-                "Describe the visible scene factually: the main subjects, the setting, actions in order, "
-                "camera framing and movement, lighting, colors, overall visual style, and if applicable the "
-                "animation style such as anime, held keyframes, limited animation, smears, or similar cues."
+                "Describe the visible scene factually: the main subjects, the setting, all actions in order, "
+                "camera framing and movement, lighting, colors, textures, overall visual style, and if "
+                "applicable the animation style such as anime, held keyframes, limited animation, smears, "
+                "or similar cues."
             ),
         ]
     )
@@ -453,8 +567,8 @@ def build_prompt(include_audio: bool, tag_hints: TagHints | None = None) -> str:
             [
                 "",
                 (
-                    "Blend any clearly audible spoken dialogue, music, ambience, crowd noise, or sound effects "
-                    "naturally into the same paragraph when they are relevant."
+                    "Blend every clearly audible spoken line, vocalization, music cue, ambience, crowd noise, "
+                    "or sound effect naturally into the same paragraph at the moment it occurs."
                 ),
             ]
         )
@@ -477,8 +591,9 @@ def build_messages(clip_path: Path, include_audio: bool, tag_hints: TagHints | N
                 {
                     "type": "text",
                     "text": (
-                        "You are a precise video captioning assistant. Keep the content factual and respond "
-                        "with one plain paragraph of unstructured text."
+                        "You are a meticulous evidence-only video captioning assistant for training video "
+                        "generation models. Describe the clip exhaustively in strict chronological order, "
+                        "and include only details that are clearly visible or audible."
                     ),
                 }
             ],
@@ -493,17 +608,26 @@ def build_messages(clip_path: Path, include_audio: bool, tag_hints: TagHints | N
     ]
 
 
-def prepare_inputs(processor: Any, messages: list[dict[str, Any]], include_audio: bool, num_frames: int) -> Any:
+def prepare_inputs(
+    processor: Any,
+    messages: list[dict[str, Any]],
+    include_audio: bool,
+    frame_sampling_plan: FrameSamplingPlan,
+    model_repo: str,
+) -> Any:
     kwargs = {
         "tokenize": True,
         "return_dict": True,
         "return_tensors": "pt",
         "add_generation_prompt": True,
         "enable_thinking": False,
-        "do_sample_frames": True,
-        "num_frames": num_frames,
+        "do_sample_frames": frame_sampling_plan.do_sample_frames,
         "load_audio_from_video": include_audio,
     }
+    if frame_sampling_plan.num_frames is not None:
+        kwargs["num_frames"] = frame_sampling_plan.num_frames
+    if frame_sampling_plan.fps is not None:
+        kwargs["fps"] = frame_sampling_plan.fps
     try:
         return processor.apply_chat_template(messages, **kwargs)
     except TypeError as exc:
@@ -511,6 +635,14 @@ def prepare_inputs(processor: Any, messages: list[dict[str, Any]], include_audio
             raise
         kwargs.pop("enable_thinking")
         return processor.apply_chat_template(messages, **kwargs)
+    except ValueError as exc:
+        if "does not have a chat template" not in str(exc):
+            raise
+        raise ValueError(
+            "The selected model processor does not provide a chat template. "
+            f"Use an instruction-tuned chat model repo instead, for example "
+            f"'{model_repo}-it' if that variant exists."
+        ) from exc
 
 
 def get_model_device(model: Any) -> Any:
@@ -552,13 +684,20 @@ def generate_caption_text(
     processor: Any,
     model: Any,
     clip_path: Path,
+    model_repo: str,
     include_audio: bool,
-    num_frames: int,
+    frame_sampling_plan: FrameSamplingPlan,
     max_new_tokens: int,
     tag_hints: TagHints | None = None,
 ) -> str:
     messages = build_messages(clip_path, include_audio, tag_hints=tag_hints)
-    inputs = prepare_inputs(processor, messages, include_audio=include_audio, num_frames=num_frames)
+    inputs = prepare_inputs(
+        processor,
+        messages,
+        include_audio=include_audio,
+        frame_sampling_plan=frame_sampling_plan,
+        model_repo=model_repo,
+    )
     if hasattr(inputs, "to"):
         inputs = inputs.to(get_model_device(model))
 
@@ -617,6 +756,8 @@ def process_video(
     clip_path: Path,
     model_repo: str,
     num_frames: int,
+    frame_sample_ratio: float,
+    sample_all_frames: bool,
     max_new_tokens: int,
     audio_supported: bool,
     tag_hints: TagHints | None = None,
@@ -634,13 +775,20 @@ def process_video(
         used_audio, audio_skip_reason = determine_audio_plan(metadata, audio_supported=audio_supported)
         record["used_audio"] = used_audio
         record["audio_skip_reason"] = audio_skip_reason
+        frame_sampling_plan = choose_frame_sampling_plan(
+            metadata=metadata,
+            min_frames=num_frames,
+            frame_sample_ratio=frame_sample_ratio,
+            sample_all_frames=sample_all_frames,
+        )
 
         raw_caption = generate_caption_text(
             processor=processor,
             model=model,
             clip_path=clip_path,
+            model_repo=model_repo,
             include_audio=used_audio,
-            num_frames=num_frames,
+            frame_sampling_plan=frame_sampling_plan,
             max_new_tokens=max_new_tokens,
             tag_hints=tag_hints,
         )
@@ -715,6 +863,8 @@ def run(args: argparse.Namespace) -> int:
                 clip_path=clip_path,
                 model_repo=args.model_repo,
                 num_frames=args.num_frames,
+                frame_sample_ratio=args.frame_sample_ratio,
+                sample_all_frames=args.sample_all_frames,
                 max_new_tokens=args.max_new_tokens,
                 audio_supported=audio_supported,
                 tag_hints=find_tag_hints(tag_lookup, clip_path=clip_path, input_dir=args.input_dir),

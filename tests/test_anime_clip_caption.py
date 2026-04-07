@@ -34,6 +34,11 @@ class FakeProcessor:
         return self.decoded_text
 
 
+class NoChatTemplateProcessor:
+    def apply_chat_template(self, messages, **kwargs):
+        raise ValueError("Cannot use apply_chat_template because this processor does not have a chat template.")
+
+
 class FakeModel:
     def __init__(self, config: object | None = None):
         self.config = config or SimpleNamespace()
@@ -143,7 +148,11 @@ class AnimeClipCaptionHelperTests(unittest.TestCase):
         payload = {
             "format": {"duration": "4.25"},
             "streams": [
-                {"codec_type": "video"},
+                {
+                    "codec_type": "video",
+                    "avg_frame_rate": "24000/1001",
+                    "nb_frames": "102",
+                },
                 {"codec_type": "audio"},
             ],
         }
@@ -157,7 +166,43 @@ class AnimeClipCaptionHelperTests(unittest.TestCase):
         with patch("anime_clip_caption.subprocess.run", return_value=completed):
             metadata = anime_clip_caption.probe_video(Path("/tmp/test.mp4"))
 
-        self.assertEqual(metadata, anime_clip_caption.VideoMetadata(duration=4.25, has_audio_track=True))
+        self.assertEqual(
+            metadata,
+            anime_clip_caption.VideoMetadata(
+                duration=4.25,
+                has_audio_track=True,
+                fps=24000 / 1001,
+                total_frames=102,
+            ),
+        )
+
+    def test_choose_frame_sampling_plan_uses_ratio_when_total_frames_are_known(self) -> None:
+        plan = anime_clip_caption.choose_frame_sampling_plan(
+            anime_clip_caption.VideoMetadata(
+                duration=4.0,
+                has_audio_track=True,
+                fps=24.0,
+                total_frames=96,
+            ),
+            min_frames=12,
+            frame_sample_ratio=0.5,
+            sample_all_frames=False,
+        )
+
+        self.assertEqual(
+            plan,
+            anime_clip_caption.FrameSamplingPlan(do_sample_frames=True, num_frames=48),
+        )
+
+    def test_choose_frame_sampling_plan_loads_all_frames_when_requested(self) -> None:
+        plan = anime_clip_caption.choose_frame_sampling_plan(
+            anime_clip_caption.VideoMetadata(duration=4.0, has_audio_track=True, fps=24.0, total_frames=96),
+            min_frames=12,
+            frame_sample_ratio=0.5,
+            sample_all_frames=True,
+        )
+
+        self.assertEqual(plan, anime_clip_caption.FrameSamplingPlan(do_sample_frames=False))
 
     def test_model_supports_audio_checks_audio_config(self) -> None:
         audio_model = FakeModel(config=SimpleNamespace(audio_config=object()))
@@ -200,6 +245,9 @@ class AnimeClipCaptionHelperTests(unittest.TestCase):
         prompt = anime_clip_caption.build_prompt(include_audio=False)
 
         self.assertIn("one plain paragraph", prompt)
+        self.assertIn("strict chronological order", prompt)
+        self.assertIn("Only describe what is directly visible or audible", prompt)
+        self.assertIn("leave it out instead of guessing", prompt)
         self.assertIn("Do not use labels like SCENE_OVERVIEW", prompt)
         self.assertIn("Only describe visual content", prompt)
         self.assertNotIn("Blend any clearly audible", prompt)
@@ -346,6 +394,33 @@ Traffic hums while a distant voice calls out.
             [("google/gemma-4-E4B-it", "float16", Path("/tmp/hf-cache"))],
         )
 
+    def test_prepare_inputs_reports_missing_chat_template_clearly(self) -> None:
+        with self.assertRaises(ValueError) as context:
+            anime_clip_caption.prepare_inputs(
+                NoChatTemplateProcessor(),
+                anime_clip_caption.build_messages(Path("/tmp/clip.mp4"), include_audio=False),
+                include_audio=False,
+                frame_sampling_plan=anime_clip_caption.FrameSamplingPlan(do_sample_frames=True, num_frames=12),
+                model_repo="google/gemma-4-26B-A4B",
+            )
+
+        self.assertIn("does not provide a chat template", str(context.exception))
+        self.assertIn("google/gemma-4-26B-A4B-it", str(context.exception))
+
+    def test_prepare_inputs_can_request_full_video_loading(self) -> None:
+        processor = FakeProcessor("unused")
+
+        anime_clip_caption.prepare_inputs(
+            processor,
+            anime_clip_caption.build_messages(Path("/tmp/clip.mp4"), include_audio=False),
+            include_audio=False,
+            frame_sampling_plan=anime_clip_caption.FrameSamplingPlan(do_sample_frames=False),
+            model_repo="google/gemma-4-E4B-it",
+        )
+
+        self.assertFalse(processor.apply_calls[0]["kwargs"]["do_sample_frames"])
+        self.assertNotIn("num_frames", processor.apply_calls[0]["kwargs"])
+
 
 class AnimeClipCaptionProcessTests(unittest.TestCase):
     def test_process_video_uses_audio_when_available(self) -> None:
@@ -368,7 +443,12 @@ Soft footsteps and room tone.
 
         with patch(
             "anime_clip_caption.probe_video",
-            return_value=anime_clip_caption.VideoMetadata(duration=5.0, has_audio_track=True),
+            return_value=anime_clip_caption.VideoMetadata(
+                duration=5.0,
+                has_audio_track=True,
+                fps=24.0,
+                total_frames=120,
+            ),
         ):
             record = anime_clip_caption.process_video(
                 processor=processor,
@@ -376,6 +456,8 @@ Soft footsteps and room tone.
                 clip_path=Path("/tmp/clip.mp4"),
                 model_repo="google/gemma-4-E4B-it",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
                 audio_supported=True,
                 tag_hints=anime_clip_caption.TagHints(
@@ -388,8 +470,11 @@ Soft footsteps and room tone.
         self.assertTrue(record["used_audio"])
         self.assertIsNone(record["audio_skip_reason"])
         self.assertEqual(processor.decoded_ids, [21, 22])
+        self.assertTrue(processor.apply_calls[0]["kwargs"]["do_sample_frames"])
+        self.assertEqual(processor.apply_calls[0]["kwargs"]["num_frames"], 60)
         self.assertTrue(processor.apply_calls[0]["kwargs"]["load_audio_from_video"])
-        self.assertIn("Blend any clearly audible", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
+        self.assertIn("strict chronological order", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
+        self.assertIn("Blend every clearly audible", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
         self.assertIn("Character hints: hero, rival", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
         self.assertIn(
             "Visual hints: hallway, dramatic lighting",
@@ -416,7 +501,12 @@ The camera pans across the audience under warm sunset light.
 
         with patch(
             "anime_clip_caption.probe_video",
-            return_value=anime_clip_caption.VideoMetadata(duration=5.0, has_audio_track=True),
+            return_value=anime_clip_caption.VideoMetadata(
+                duration=5.0,
+                has_audio_track=True,
+                fps=24.0,
+                total_frames=120,
+            ),
         ):
             record = anime_clip_caption.process_video(
                 processor=processor,
@@ -424,6 +514,8 @@ The camera pans across the audience under warm sunset light.
                 clip_path=Path("/tmp/clip.mp4"),
                 model_repo="google/gemma-4-31B-it",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
                 audio_supported=False,
             )
@@ -431,9 +523,12 @@ The camera pans across the audience under warm sunset light.
         self.assertEqual(record["status"], "captioned")
         self.assertFalse(record["used_audio"])
         self.assertEqual(record["audio_skip_reason"], "model does not support audio input")
+        self.assertTrue(processor.apply_calls[0]["kwargs"]["do_sample_frames"])
+        self.assertEqual(processor.apply_calls[0]["kwargs"]["num_frames"], 60)
         self.assertFalse(processor.apply_calls[0]["kwargs"]["load_audio_from_video"])
         self.assertIn("Only describe visual content", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
-        self.assertNotIn("Blend any clearly audible", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
+        self.assertIn("Only describe what is directly visible or audible", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
+        self.assertNotIn("Blend every clearly audible", processor.apply_calls[0]["messages"][1]["content"][1]["text"])
         self.assertEqual(
             record["caption"],
             "A bright outdoor crowd shot. The camera pans across the audience under warm sunset light.",
@@ -457,6 +552,8 @@ The camera pans across the audience under warm sunset light.
                 clip_path=Path("/tmp/clip.mp4"),
                 model_repo="google/gemma-4-E4B-it",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
                 audio_supported=True,
             )
@@ -477,6 +574,8 @@ class AnimeClipCaptionRunTests(unittest.TestCase):
                 device="cuda",
                 dtype="auto",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
             )
 
@@ -500,6 +599,8 @@ class AnimeClipCaptionRunTests(unittest.TestCase):
                 device="cuda",
                 dtype="auto",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
             )
 
@@ -537,6 +638,8 @@ class AnimeClipCaptionRunTests(unittest.TestCase):
                 device="cuda",
                 dtype="auto",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
             )
 
@@ -565,6 +668,8 @@ class AnimeClipCaptionRunTests(unittest.TestCase):
                 device="cpu",
                 dtype="auto",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
                 cache_dir=cache_dir,
             )
@@ -609,6 +714,8 @@ class AnimeClipCaptionRunTests(unittest.TestCase):
                 device="cuda",
                 dtype="auto",
                 num_frames=12,
+                frame_sample_ratio=0.5,
+                sample_all_frames=False,
                 max_new_tokens=768,
             )
             seen_hints: list[anime_clip_caption.TagHints | None] = []

@@ -360,7 +360,7 @@ What it does:
 
 - Loads the chosen Hugging Face multimodal model.
 - If `--cache-dir` is set, stores downloaded Hugging Face model files there so they can persist across pod restarts when backed by network storage.
-- Samples video frames from each clip.
+- Loads all frames with `--sample-all-frames`, or by default samples at least half the source frames when metadata is available, with `--num-frames` acting as a floor.
 - Uses `tags.jsonl` in the same directory as helper hints when present.
 - Includes audio only when the model supports audio and the clip has an audio track.
 - Writes `captions.jsonl`.
@@ -382,9 +382,10 @@ Important output fields:
 
 Caption format:
 
-- Successful captions are written as a single plain paragraph of continuous text.
+- Successful captions are written as a single plain paragraph of continuous text in strict chronological order.
 - Captions do not include section headers such as `SCENE_OVERVIEW`, `VISUAL_DETAILS`, `DIALOGUE`, `OTHER_SOUNDS`, `VISUAL`, or `AUDIO`.
-- When audio is used, audible dialogue and other sounds are blended naturally into the same paragraph.
+- Captions are intended to be exhaustive, evidence-only descriptions for video-generation training data and should omit details that are not clearly visible or audible.
+- When audio is used, audible dialogue and other sounds are blended naturally into the same paragraph at the point where they occur.
 - The compatibility fields `scene_overview`, `visual_details`, `dialogue`, and `other_sounds` remain in the manifest but are left `null` for newly generated captions.
 
 Failure behavior:
